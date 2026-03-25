@@ -1,19 +1,26 @@
 # jmri-ws
 
-Type-safe, Effect-based JMRI WebSocket client for Node.js.
+Type-safe, Effect-based JMRI WebSocket client for browser and Node.js.
 
 Provides a typed interface to the [JMRI JSON WebSocket protocol](https://www.jmri.org/JavaDoc/doc/jmri/server/json/package-summary.html) — covering turnouts, sensors, signal masts, blocks, power, throttles, the fast clock, and more.
+
+Uses the native browser `WebSocket` global — no Node-only dependencies.
 
 ---
 
 ## Install
 
 ```bash
-npm install effect ws
-npm install --save-dev @types/ws typescript
+npm install effect
+npm install --save-dev typescript
 ```
 
-Then copy the `src/` files into your project, or use the package directly.
+**Node 18/20 only:** install `ws` as a polyfill (Node 21+ has native WebSocket):
+
+```bash
+npm install ws
+npm install --save-dev @types/ws
+```
 
 ---
 
@@ -43,6 +50,18 @@ Effect.runFork(
     Effect.provide(config),
   )
 )
+```
+
+### Node 18/20: inject `ws`
+
+```typescript
+import { WebSocket } from "ws"
+
+const config = makeConfig({
+  host: "localhost",
+  port: 12080,
+  WebSocketConstructor: WebSocket,
+})
 ```
 
 ---
@@ -81,16 +100,6 @@ yield* client.send(setSignalMastHeld("IF$shsm:AAR-2:approach(IT1)", true))
 yield* client.send(fireRoute("IR:AUTO:0001"))
 ```
 
-### List all objects of a type
-
-```typescript
-// Returns a Stream — take the first N to avoid running forever
-const turnouts = yield* Stream.take(
-  Stream.filter(client.list("turnout"), (msg) => msg.type === "turnout"),
-  100,
-).pipe(Stream.runCollect)
-```
-
 ### Multiple subscriptions in parallel
 
 ```typescript
@@ -112,12 +121,13 @@ yield* Fiber.joinAll(fibers)
 
 ```typescript
 const config = makeConfig({
-  host: "localhost",       // JMRI web server host
-  port: 12080,             // default JMRI web server port
-  path: "/json/v5",        // optional, defaults to "/json/v5"
-  version: "5.3.1",        // optional, negotiated in hello message
-  reconnectBaseMs: 500,    // optional, exponential backoff base
-  reconnectMaxMs: 30_000,  // optional, reconnect backoff cap
+  host: "localhost",              // JMRI web server host
+  port: 12080,                    // default JMRI web server port
+  path: "/json/v5",               // optional, defaults to "/json/v5"
+  version: "5.3.1",               // optional, negotiated in hello message
+  reconnectBaseMs: 500,           // optional, exponential backoff base
+  reconnectMaxMs: 30_000,         // optional, reconnect backoff cap
+  WebSocketConstructor: WebSocket // optional, only needed for Node 18/20
 })
 ```
 
@@ -218,7 +228,7 @@ program.pipe(
 ```
 src/
 ├── states.ts     State constants (TurnoutState, SensorState, etc.)
-├── schema.ts     Effect Schema definitions for all JMRI message types
+├── schema.ts     Effect Schema definitions for all JMRI message 
 ├── requests.ts   Typed request builder functions
 ├── client.ts     JmriClient Effect service + Layer
 ├── index.ts      Barrel exports
@@ -229,7 +239,7 @@ src/
 
 ## Requirements
 
-- Node.js 18+
+- Modern browser with native WebSocket **or** Node.js 21+
+- Node.js 18/20: install `ws` and pass `WebSocketConstructor` in config
 - `effect` ^3.10.0
-- `ws` ^8.18.0
 - TypeScript 5.x with `strict: true`

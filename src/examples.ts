@@ -23,7 +23,7 @@ import {
   setThrottleSpeed,
   setThrottleForward,
   setThrottleFunction,
-} from "./src/index.js"
+} from "./index.js"
 import { Effect, Stream, Layer, Schedule, Fiber } from "effect"
 
 // ─── Config ───────────────────────────────────────────────────────────────────

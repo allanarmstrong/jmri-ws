@@ -1,6 +1,13 @@
 /**
  * Effect-based JMRI WebSocket client.
  *
+ * Transport:
+ *   Uses the native WebSocket global — available in all modern browsers and
+ *   Node.js 21+. For Node 18/20, pass a WebSocketConstructor in config:
+ *
+ *     import { WebSocket } from "ws"
+ *     makeConfig({ host: "localhost", port: 12080, WebSocketConstructor: WebSocket })
+ *
  * Architecture:
  *   - WebSocket connection is managed inside a scoped Effect
  *   - Incoming messages are broadcast through a PubSub<JmriMessage>
@@ -15,7 +22,6 @@
  *   This maps naturally onto Stream — subscribe() gives you both.
  */
 
-import WebSocket from "ws"
 import {
   Effect,
   Stream,
@@ -28,32 +34,37 @@ import {
   Context,
   Layer,
   Scope,
-  Exit,
-  Cause,
-  Option,
-} from "effect"
-import { JmriFrame, JmriMessage, JmriListResponse } from "./schema.js"
-import type { JmriMessageData, JmriMessageOfType } from "./schema.js"
+} from "effect";
+import { JmriFrame, JmriMessage } from "./schema.js";
+import type { JmriMessageData, JmriMessageOfType } from "./schema.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 export interface JmriConfig {
-  readonly host: string
-  readonly port: number
+  readonly host: string;
+  readonly port: number;
   /** WebSocket path, defaults to "/json/v5" */
-  readonly path?: string
+  readonly path?: string;
   /** Protocol version to negotiate in hello, defaults to no preference */
-  readonly version?: string
+  readonly version?: string;
   /** Reconnect backoff: base delay in ms, defaults to 500 */
-  readonly reconnectBaseMs?: number
+  readonly reconnectBaseMs?: number;
   /** Reconnect backoff: max delay in ms, defaults to 30_000 */
-  readonly reconnectMaxMs?: number
+  readonly reconnectMaxMs?: number;
+  /**
+   * WebSocket constructor to use. Defaults to globalThis.WebSocket.
+   *
+   * Node.js 21+ has WebSocket built-in. For Node 18/20, install `ws` and pass:
+   *   import { WebSocket } from "ws"
+   *   { WebSocketConstructor: WebSocket }
+   */
+  readonly WebSocketConstructor?: typeof globalThis.WebSocket;
 }
 
-export const JmriConfig = Context.GenericTag<JmriConfig>("JmriConfig")
+export const JmriConfig = Context.GenericTag<JmriConfig>("JmriConfig");
 
 export const makeConfig = (config: JmriConfig): Layer.Layer<JmriConfig> =>
-  Layer.succeed(JmriConfig, config)
+  Layer.succeed(JmriConfig, config);
 
 // ─── Client Service Interface ─────────────────────────────────────────────────
 
@@ -62,7 +73,7 @@ export interface JmriClient {
    * Raw stream of every validated inbound message.
    * Useful for debugging or building custom subscriptions.
    */
-  readonly messages: Stream.Stream<JmriMessage, JmriClientError>
+  readonly messages: Stream.Stream<JmriMessage, JmriClientError>;
 
   /**
    * Send any serialisable message to JMRI.
@@ -70,7 +81,7 @@ export interface JmriClient {
    */
   readonly send: (
     payload: Record<string, unknown>,
-  ) => Effect.Effect<void, JmriClientError>
+  ) => Effect.Effect<void, JmriClientError>;
 
   /**
    * Subscribe to a specific named object.
@@ -83,125 +94,139 @@ export interface JmriClient {
     type: T,
     name: string,
     id?: number,
-  ) => Stream.Stream<JmriMessageData<T>, JmriClientError>
+  ) => Stream.Stream<JmriMessageData<T>, JmriClientError>;
 
   /**
    * List all objects of a type.
    * Over WebSocket this also subscribes to future list changes.
    * Returns a Stream of individual messages from the list response.
    */
-  readonly list: (
-    type: string,
-  ) => Stream.Stream<JmriMessage, JmriClientError>
+  readonly list: (type: string) => Stream.Stream<JmriMessage, JmriClientError>;
 
   /**
    * Ping and wait for pong.
    */
-  readonly ping: () => Effect.Effect<void, JmriClientError>
+  readonly ping: () => Effect.Effect<void, JmriClientError>;
 }
 
-export const JmriClient = Context.GenericTag<JmriClient>("JmriClient")
+export const JmriClient = Context.GenericTag<JmriClient>("JmriClient");
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 export type JmriClientError =
-  | { readonly _tag: "ConnectionError"; readonly message: string; readonly cause?: unknown }
-  | { readonly _tag: "ParseError"; readonly message: string; readonly raw: string }
+  | {
+      readonly _tag: "ConnectionError";
+      readonly message: string;
+      readonly cause?: unknown;
+    }
+  | {
+      readonly _tag: "ParseError";
+      readonly message: string;
+      readonly raw: string;
+    }
   | { readonly _tag: "SendError"; readonly message: string }
-  | { readonly _tag: "ProtocolError"; readonly message: string; readonly code: number }
+  | {
+      readonly _tag: "ProtocolError";
+      readonly message: string;
+      readonly code: number;
+    };
 
 const ConnectionError = (
   message: string,
   cause?: unknown,
-): JmriClientError => ({ _tag: "ConnectionError", message, cause })
+): JmriClientError => ({ _tag: "ConnectionError", message, cause });
 
 const ParseError = (message: string, raw: string): JmriClientError => ({
   _tag: "ParseError",
   message,
   raw,
-})
+});
 
 const SendError = (message: string): JmriClientError => ({
   _tag: "SendError",
   message,
-})
+});
 
 const ProtocolError = (message: string, code: number): JmriClientError => ({
   _tag: "ProtocolError",
   message,
   code,
-})
+});
 
 // ─── Decode helpers ───────────────────────────────────────────────────────────
 
-const decodeFrame = Schema.decodeUnknown(JmriFrame)
+const decodeFrame = Schema.decodeUnknown(JmriFrame);
+
 const decodeJSON = (raw: string): Effect.Effect<unknown, JmriClientError> =>
   Effect.try({
     try: () => JSON.parse(raw) as unknown,
     catch: (e) => ParseError(`Invalid JSON: ${String(e)}`, raw),
-  })
+  });
 
-const parseFrame = (
-  raw: string,
-): Effect.Effect<JmriFrame, JmriClientError> =>
+const parseFrame = (raw: string): Effect.Effect<JmriFrame, JmriClientError> =>
   Effect.flatMap(decodeJSON(raw), (parsed) =>
-    Effect.mapError(
-      decodeFrame(parsed),
-      (e) =>
-        ParseError(
-          `Schema validation failed: ${ParseResult.TreeFormatter.formatErrorSync(e)}`,
-          raw,
-        ),
+    Effect.mapError(decodeFrame(parsed), (e) =>
+      ParseError(
+        `Schema validation failed: ${ParseResult.TreeFormatter.formatErrorSync(e)}`,
+        raw,
+      ),
     ),
-  )
+  );
 
-// ─── WebSocket connection loop ────────────────────────────────────────────────
+// ─── WebSocket connection ─────────────────────────────────────────────────────
 
 const makeConnection = (
   config: JmriConfig,
   inbound: PubSub.PubSub<JmriMessage>,
   outbound: Queue.Queue<string>,
-): Effect.Effect<void, JmriClientError, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.async<WebSocket, JmriClientError>((resume) => {
-      const url = `ws://${config.host}:${config.port}${config.path ?? "/json/v5"}`
-      const ws = new WebSocket(url)
+): Effect.Effect<void, JmriClientError, Scope.Scope> => {
+  const WS = config.WebSocketConstructor ?? globalThis.WebSocket;
 
-      ws.once("open", () => resume(Effect.succeed(ws)))
-      ws.once("error", (err) =>
-        resume(Effect.fail(ConnectionError(`WebSocket open failed: ${err.message}`, err))),
-      )
+  return Effect.acquireRelease(
+    // Open the socket
+    Effect.async<WebSocket, JmriClientError>((resume) => {
+      const url = `ws://${config.host}:${config.port}${config.path ?? "/json/v5"}`;
+      const ws = new WS(url);
+
+      const onOpen = () => {
+        ws.removeEventListener("error", onOpenError);
+        resume(Effect.succeed(ws));
+      };
+      const onOpenError = (event: Event) => {
+        ws.removeEventListener("open", onOpen);
+        resume(Effect.fail(ConnectionError(`WebSocket open failed`, event)));
+      };
+
+      ws.addEventListener("open", onOpen, { once: true });
+      ws.addEventListener("error", onOpenError, { once: true });
     }),
-    (ws) =>
-      Effect.sync(() => {
-        ws.close()
-      }),
+    // Cleanup: close the socket
+    (ws) => Effect.sync(() => ws.close()),
   ).pipe(
     Effect.flatMap((ws) =>
       Effect.gen(function* () {
         // Sender fiber: drain outbound queue → ws.send
+        // Native WebSocket.send() is synchronous — no callback.
         const senderFiber = yield* Effect.fork(
           Effect.forever(
             Effect.flatMap(Queue.take(outbound), (msg) =>
-              Effect.async<void, JmriClientError>((resume) => {
-                ws.send(msg, (err) => {
-                  if (err) {
-                    resume(Effect.fail(SendError(err.message)))
-                  } else {
-                    resume(Effect.void)
-                  }
-                })
+              Effect.try({
+                try: () => ws.send(msg),
+                catch: (e) => SendError(`ws.send failed: ${String(e)}`),
               }),
             ),
           ),
-        )
+        );
 
         // Receiver: listen for messages and publish to PubSub
         const receiverEffect = Effect.async<void, JmriClientError>((resume) => {
-          ws.on("message", (data) => {
-            const raw = data.toString()
+          ws.addEventListener("message", (event: MessageEvent) => {
+            // event.data is always a string when JMRI sends JSON
+            const raw =
+              typeof event.data === "string"
+                ? event.data
+                : JSON.stringify(event.data);
 
-            // Run parse + publish as a fire-and-forget Effect
             Effect.runFork(
               Effect.flatMap(parseFrame(raw), (frame) => {
                 if (Array.isArray(frame)) {
@@ -210,41 +235,55 @@ const makeConnection = (
                     frame as JmriMessage[],
                     (item) => PubSub.publish(inbound, item),
                     { discard: true },
-                  )
+                  );
                 }
-                // Single message — publish to the hub
-                return Effect.asVoid(PubSub.publish(inbound, frame as JmriMessage))
+                return Effect.asVoid(
+                  PubSub.publish(inbound, frame as JmriMessage),
+                );
               }),
-            )
-          })
+            );
+          });
 
-          ws.once("close", (code, reason) => {
-            resume(
-              Effect.fail(
-                ConnectionError(`WebSocket closed: ${code} ${reason.toString()}`),
-              ),
-            )
-          })
+          ws.addEventListener(
+            "close",
+            (event: CloseEvent) => {
+              resume(
+                Effect.fail(
+                  ConnectionError(
+                    `WebSocket closed: ${event.code} ${event.reason}`,
+                  ),
+                ),
+              );
+            },
+            { once: true },
+          );
 
-          ws.once("error", (err) => {
-            resume(Effect.fail(ConnectionError(err.message, err)))
-          })
-        })
+          ws.addEventListener(
+            "error",
+            (event: Event) => {
+              resume(Effect.fail(ConnectionError(`WebSocket error`, event)));
+            },
+            { once: true },
+          );
+        });
 
         // Negotiate version if configured
         if (config.version) {
           yield* Queue.offer(
             outbound,
-            JSON.stringify({ type: "hello", data: { version: config.version } }),
-          )
+            JSON.stringify({
+              type: "hello",
+              data: { version: config.version },
+            }),
+          );
         }
 
-        yield* receiverEffect
-
-        yield* Fiber.interrupt(senderFiber)
+        yield* receiverEffect;
+        yield* Fiber.interrupt(senderFiber);
       }),
     ),
-  )
+  );
+};
 
 // ─── Client Layer ─────────────────────────────────────────────────────────────
 
@@ -255,35 +294,31 @@ export const JmriClientLive: Layer.Layer<
 > = Layer.scoped(
   JmriClient,
   Effect.gen(function* () {
-    const config = yield* JmriConfig
+    const config = yield* JmriConfig;
 
     // PubSub broadcasts every inbound message to all active subscribers
-    const inbound = yield* PubSub.unbounded<JmriMessage>()
+    const inbound = yield* PubSub.unbounded<JmriMessage>();
 
     // Queue for outbound messages — sender fiber drains this
-    const outbound = yield* Queue.unbounded<string>()
+    const outbound = yield* Queue.unbounded<string>();
 
-    // Connection fiber with reconnection loop
+    // Connection fiber with exponential backoff reconnection
     const reconnectSchedule = Schedule.exponential(
       config.reconnectBaseMs ?? 500,
-    ).pipe(
-      Schedule.union(
-        Schedule.spaced(config.reconnectMaxMs ?? 30_000),
-      ),
-    )
+    ).pipe(Schedule.union(Schedule.spaced(config.reconnectMaxMs ?? 30_000)));
 
     const connectionLoop = Effect.scoped(
       makeConnection(config, inbound, outbound),
     ).pipe(
       Effect.catchAll((err) =>
-        Effect.logWarning(`JMRI connection lost (${err.message}), reconnecting...`).pipe(
-          Effect.map(() => err),
-        ),
+        Effect.logWarning(
+          `JMRI connection lost (${err.message}), reconnecting...`,
+        ).pipe(Effect.map(() => err)),
       ),
       Effect.retry(reconnectSchedule),
-    )
+    );
 
-    yield* Effect.fork(connectionLoop)
+    yield* Effect.fork(connectionLoop);
 
     // ── Public API ─────────────────────────────────────────────────────────
 
@@ -296,7 +331,7 @@ export const JmriClientLive: Layer.Layer<
           catch: (e) => SendError(`JSON serialisation failed: ${String(e)}`),
         }),
         (json) => Queue.offer(outbound, json),
-      )
+      );
 
     const messages: Stream.Stream<JmriMessage, JmriClientError> =
       Stream.fromPubSub(inbound).pipe(
@@ -310,7 +345,7 @@ export const JmriClientLive: Layer.Layer<
               )
             : Effect.succeed(msg),
         ),
-      )
+      );
 
     const subscribe = <T extends JmriMessage["type"]>(
       type: T,
@@ -327,24 +362,25 @@ export const JmriClientLive: Layer.Layer<
             "data" in msg &&
             (msg.data as { name?: string }).name === name,
         ),
-        Stream.map((msg) => (msg as JmriMessageOfType<T> & { data: JmriMessageData<T> }).data),
-      )
+        Stream.map(
+          (msg) =>
+            (msg as JmriMessageOfType<T> & { data: JmriMessageData<T> }).data,
+        ),
+      );
 
     const list = (type: string): Stream.Stream<JmriMessage, JmriClientError> =>
       Stream.fromEffect(send({ list: type })).pipe(
         Stream.flatMap(() => messages),
         Stream.filter((msg) => msg.type === type),
-      )
+      );
 
     const pingImpl = (): Effect.Effect<void, JmriClientError> =>
       Effect.flatMap(send({ type: "ping" }), () =>
         Stream.take(
           Stream.filter(messages, (msg) => msg.type === "pong"),
           1,
-        ).pipe(
-          Stream.runDrain,
-        ),
-      )
+        ).pipe(Stream.runDrain),
+      );
 
     return JmriClient.of({
       messages,
@@ -352,13 +388,13 @@ export const JmriClientLive: Layer.Layer<
       subscribe,
       list,
       ping: pingImpl,
-    })
+    });
   }),
-)
+);
 
-// ─── Convenience accessor (use inside Effect.gen) ─────────────────────────────
+// ─── Convenience accessor ─────────────────────────────────────────────────────
 
-export const getClient = JmriClient
+export const getClient = JmriClient;
 
 /**
  * Subscribe helper for use in Effect.gen.
@@ -377,5 +413,4 @@ export const subscribeEffect = <T extends JmriMessage["type"]>(
   Stream.Stream<JmriMessageData<T>, JmriClientError>,
   never,
   JmriClient
-> =>
-  Effect.map(JmriClient, (client) => client.subscribe(type, name, id))
+> => Effect.map(JmriClient, (client) => client.subscribe(type, name, id));
