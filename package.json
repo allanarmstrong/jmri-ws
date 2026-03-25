@@ -1,0 +1,19 @@
+{
+  "name": "jmri-ws",
+  "version": "1.0.0",
+  "description": "Type-safe Effect-based JMRI WebSocket client",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "effect": "^3.10.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  }
+}
